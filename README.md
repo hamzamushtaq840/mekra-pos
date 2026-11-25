@@ -1,12 +1,22 @@
-# POS
+# Mekra POS
 
-Offline Electron + React + SQLite point of sale for small retail and grocery stores. The application stores all operational data in the Electron `userData` directory and does not require an internet connection after installation.
+An offline point of sale for small retail and grocery stores, built with Electron, React and SQLite (`better-sqlite3`). All data stays on the shop computer. No internet connection is needed after installation.
+
+## Features
+
+- **New sale**: barcode scanning with automatic add-to-cart, product search, quantity editing, hold and recall, age-restriction alerts, refunds, and a checkout discount.
+- **Khata (customer credit)**: an underpaid sale is added to the selected customer's balance. Payments reduce it.
+- **Receipts**: each sale gets a permanent unique number such as `R-20261031-7F3A2C`. Receipts can be previewed, reprinted or deleted from Transactions.
+- **Inventory**: products (blank SKU generates a barcode), categories with images, suppliers with payables, and stock-in with unpaid-amount tracking.
+- **Dashboard**: today's sales and profit, payables and receivables, a sales trend chart, low-stock watch and hardware status.
+- **Tables**: every table has search and pagination (10, 25, 50 or 100 rows per page).
+- **Settings**: store profile, logo, theme colors, printer selection, test print and receipt preview.
 
 ## Requirements
 
 - Node.js 20 LTS or newer
-- Windows: Visual Studio Build Tools with the Desktop development with C++ workload (required by `better-sqlite3` if a prebuilt binary is unavailable)
-- macOS/Linux: the platform's standard C/C++ build toolchain
+- Windows: Visual Studio Build Tools with the "Desktop development with C++" workload (needed by `better-sqlite3` if no prebuilt binary is available)
+- macOS or Linux: the standard C/C++ build toolchain
 
 ## Install and run
 
@@ -15,63 +25,90 @@ npm install
 npm run dev
 ```
 
-Create a production build:
+Build the Windows installer:
 
 ```bash
-npm run dist
+npm run dist:win
 ```
 
-The Windows installer is written to `dist/`. `better-sqlite3`, `escpos`, and `escpos-usb` are bundled as native/runtime dependencies by Electron Builder.
+The installer is written to the output folder set in your electron-builder config.
+
+If Electron reports a native module version mismatch after changing Electron versions:
+
+```bash
+npx electron-builder install-app-deps
+npm run dist:win
+```
 
 ## First launch
 
-On the first launch, enter the fixed one-time setup PIN `827123`. The PIN field is masked. The Electron main process validates the PIN, creates all SQLite tables, and stores an initialization marker in the local database. The setup PIN is not requested again during normal operation because this build intentionally has no user roles or recurring login. Machine IDs, activation keys, and `keygen.js` are not used.
+On first launch, enter the one-time setup PIN. The main process checks the PIN, creates the SQLite tables and stores an initialization marker. The PIN is not asked again. This build has no user roles or recurring login.
 
-## Data and theme
+The PIN is defined as `SETUP_PIN` in `main.cjs`. Change it before giving the app to a client.
 
-The database is `pos_data.db` in the Electron `userData` directory. The theme is `theme.json` in the same directory and defaults to:
+## Data location
+
+Everything is stored in Electron's `userData` folder:
+
+| File or folder      | Contents                                |
+| ------------------- | --------------------------------------- |
+| `pos_data.db`       | SQLite database                         |
+| `theme.json`        | Theme colors                            |
+| `printer.json`      | Selected printer                        |
+| `images/`           | Uploaded category images and store logo |
+| `printer-error.log` | Printer and drawer errors               |
+
+Settings > Hardware > "Open log folder" opens this folder. To back up the shop, copy `pos_data.db` and `images/`.
+
+Database changes for new features are applied automatically when the app starts, so existing data is kept. For example, the `receipts.discount` column is added to older databases.
+
+The default theme is:
 
 ```json
 { "primary": "#2E7D32", "secondary": "#FFFFFF", "background": "#F5F5F5" }
 ```
 
-The Settings screen updates the store profile row and theme colors without rebuilding the app. The store profile is constrained to one row and includes company name, trade, address, phone, email, logo path, and receipt footer text.
-
 ## Hardware
 
-The main process owns hardware access. The optional drawer action sends the exact ESC/POS kick bytes `1B 70 00 19 FA` (decimal `27 112 0 25 250`) through `escpos-usb`. Install the printer's Windows driver, connect the USB thermal printer, and verify it appears in Device Manager. For generic printers, identify VID/PID in Device Manager → Details → Hardware Ids. Select the matching USB printer in the eventual hardware settings implementation; HID barcode scanners normally behave as keyboards and send a fast SKU sequence ending in Enter.
+### Receipt printer and cash drawer
 
-HID barcode scanners emulate keyboard input, so the dashboard reports physical scanner detection conservatively. The Sale screen changes to ready only after it receives a barcode sequence ending in Enter. Hardware access can fail safely when no printer is attached; database checkout remains usable. Receipt payloads must always append:
+Receipts are sent to the printer as raw ESC/POS bytes through the operating system's print spooler. The `escpos` and `escpos-usb` packages are not used.
+
+1. Install the printer's driver and confirm it appears in Windows under Printers.
+2. Open Settings > Hardware and choose the printer.
+3. Use "Test print" to check the width. Receipts are set for 80 mm paper at 48 characters per line. If text wraps on your printer, set `RECEIPT_WIDTH` to `42` in `main.cjs`.
+
+The cash drawer opens by sending the kick command `1B 70 00 19 FA` to the same printer. If no printer is attached, the sale still completes and a toast shows the printer error.
+
+Settings > Hardware > "Preview receipt" shows how the latest receipt will print, with no printer needed.
+
+### Barcode scanner
+
+HID scanners behave like a keyboard that types the barcode quickly and ends with Enter. The New sale page detects this by typing speed (characters less than about 80 ms apart) and adds the matching item to the cart automatically. It does not matter whether the search box is focused.
+
+Scans are ignored while you are typing in the cash, discount, quantity or customer fields, or while a popup is open. The scanner badge says "Scanner ready" only after the first successful scan, because a keyboard-style device can't be detected earlier. If your scanner is slow and scans aren't recognised, raise `SCAN_GAP_MS` in the `Sale` component.
+
+## Discounts
+
+Enter a discount amount in the checkout panel. It is subtracted from the subtotal, can't exceed it, and is stored on the receipt. Printed receipts show SUBTOTAL and DISCOUNT lines when a discount was given. `total_amount` on a receipt is always the final amount after discount, and today's profit on the dashboard subtracts discounts.
+
+## Balances
+
+- **Supplier**: `current_balance` is what you owe the supplier. Stock-in adds only the unpaid part. A supplier payment reduces it, never below zero.
+- **Customer (Khata)**: `current_balance` is what the customer owes you. An underpaid sale adds the shortfall once per sale. Receiving a payment reduces it.
+- Payment history is in Reports.
+
+Deleting a receipt restores stock but does not reverse the customer's Khata balance.
+
+## Receipt footer
+
+Every printed receipt ends with the store's closing message followed by the fixed line:
 
 ```text
 Developed by Hamza
 ```
 
-rm -rf release
-npm run dist:win
-before dispatching to an ESC/POS device.
+## Notes
 
-## Operational modules
-
-The app includes one-time activation, optimized Sale checkout with scanner buffering, search, cart quantity updates, Hold/Recall, age restriction alerts, checkout and Khata balances, dashboard totals, low-stock reporting, Products, Categories, Suppliers with payment entry, Customers/Khata with payment receipt, Transactions, refunds, and store/theme settings. The UI deliberately avoids CSS animations, transitions, box shadows, and broad state updates so it remains responsive on low-end hardware.
-
-The current workspace UI is organized as a dark navigation rail with large touch-friendly inputs, searchable domain-specific CRUD pages, modal editing forms, supplier payable payments, customer Khata receipts, payment reports, dashboard hardware cards, a sales trend chart, low-stock monitoring, and a complete checkout result modal. Products use the Electron `save-product` handler so blank SKUs receive a unique generated barcode before saving.
-
-Supplier balance semantics are: `current_balance` is the amount owed to the supplier. Receiving stock increases it only for the unpaid portion; recording a supplier payment reduces it, never below zero. Customer balance semantics are the inverse from the shop perspective: an underpaid Khata sale increases the customer balance and receiving a payment reduces it. These movements are visible in Reports.
-
-Theme settings are stored in `theme.json`, applied immediately to CSS variables, and saved without rebuilding. The editable values are `primary`, `secondary`, and `background`; the receipt tag remains the required hardcoded `Developed by Hamza`.
-
-The Sale screen now confirms each checkout in a lightweight modal. Every checkout receives a permanent unique receipt number such as `R-20261031-7F3A2C`; the number is stored with a unique database index and is never reused after voiding. From the modal the owner can print the receipt, open the drawer, or return to a new sale. The same receipt print action is available from Transactions. Printing builds the receipt in the Electron main process from the saved receipt, items, and store profile, then sends it through `escpos-usb`; if no compatible printer is attached, the screen remains usable and shows the printer error as a toast. The required `Developed by Hamza` footer is appended to every generated payload.
-
-Success, warning, and printer/database errors use a global toast region rather than browser alert dialogs. The Dashboard includes a dependency-free seven-day sales bar chart and a low-stock watch panel, keeping the application offline and avoiding a charting-library bundle. Cash tendered, customer selection, and all checkout actions use explicit vertical field spacing for reliable barcode-counter operation.
-
-On first activation, the app inserts demo data if the products table is empty: five grocery products, two suppliers, two customers, and a Groceries category. This makes Checkout and Stock In testable immediately. Demo products use SKUs `890100000001` through `890100000005` and can be edited or deleted from the management screens.
-
-## Native dependency rebuild
-
-If Electron reports a native module ABI mismatch after changing Electron versions:
-
-```bash
-npx electron-builder install-app-deps
-npm run dist
-```
+- Demo data helper: `seedDemoData()` exists in `main.cjs` but is not called on startup. Call it from `initDb` if you want sample products for testing.
+- The first-run PIN and the hardcoded receipt footer are intentional in this build.
