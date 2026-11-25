@@ -12,6 +12,9 @@ const money = (value) =>
     maximumFractionDigits: 2,
   });
 const today = () => new Date().toISOString().slice(0, 10);
+// Barcode scanners are keyboard devices, so we can only know one is working
+// after it has actually scanned something. Remember that across pages.
+let scannerSeen = false;
 
 const ToastContext = React.createContext(() => {});
 function useToast() {
@@ -85,7 +88,7 @@ function Modal({ title, children, onClose, wide = false }) {
       <div className={`modal ${wide ? "modal-wide" : ""}`}>
         <div className="modal-head">
           <div>
-            <p className="eyebrow">Hamza POS</p>
+            <p className="eyebrow">Mekra POS</p>
             <h3>{title}</h3>
           </div>
           {onClose && (
@@ -221,11 +224,13 @@ function SearchBox({
   onChange,
   placeholder = "Search by name, SKU or phone...",
   onKeyDown,
+  inputRef,
 }) {
   return (
     <div className="search-box">
       <span>⌕</span>
       <input
+        ref={inputRef}
         value={value}
         onChange={(event) => onChange(event.target.value)}
         onKeyDown={onKeyDown}
@@ -267,6 +272,177 @@ function StatusBadge({ children, tone = "green" }) {
 }
 function singular(label) {
   return label.replace(/ies$/, "y").replace(/s$/, "");
+}
+
+// ---------- Reusable pagination + data table ----------
+const PAGE_SIZES = [10, 25, 50, 100];
+
+function usePagination(rows, initialSize = 10) {
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSizeState] = useState(initialSize);
+  const total = rows.length;
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const current = Math.min(page, pageCount);
+  const start = (current - 1) * pageSize;
+  return {
+    page: current,
+    setPage,
+    pageSize,
+    setPageSize: (size) => {
+      setPageSizeState(size);
+      setPage(1);
+    },
+    total,
+    pageCount,
+    from: total ? start + 1 : 0,
+    to: Math.min(total, start + pageSize),
+    pageRows: rows.slice(start, start + pageSize),
+  };
+}
+
+function pageWindow(current, count) {
+  if (count <= 7) return Array.from({ length: count }, (_, i) => i + 1);
+  const pages = [1];
+  const left = Math.max(2, current - 1);
+  const right = Math.min(count - 1, current + 1);
+  if (left > 2) pages.push("gap-left");
+  for (let p = left; p <= right; p++) pages.push(p);
+  if (right < count - 1) pages.push("gap-right");
+  pages.push(count);
+  return pages;
+}
+
+function Pagination({ pagination }) {
+  const { page, pageCount, pageSize, total, from, to, setPage, setPageSize } =
+    pagination;
+  return (
+    <div className="table-footer">
+      <span className="table-footer-info">
+        Showing {from}–{to} of {total}
+      </span>
+      <div className="table-footer-controls">
+        <label className="page-size">
+          Rows per page
+          <select
+            value={pageSize}
+            onChange={(event) => setPageSize(Number(event.target.value))}
+          >
+            {PAGE_SIZES.map((size) => (
+              <option key={size} value={size}>
+                {size}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="pager">
+          <button
+            type="button"
+            disabled={page <= 1}
+            onClick={() => setPage(page - 1)}
+            aria-label="Previous page"
+          >
+            ‹
+          </button>
+          {pageWindow(page, pageCount).map((item) =>
+            typeof item === "number" ? (
+              <button
+                type="button"
+                key={item}
+                className={item === page ? "active" : ""}
+                onClick={() => setPage(item)}
+              >
+                {item}
+              </button>
+            ) : (
+              <span className="pager-gap" key={item}>
+                …
+              </span>
+            ),
+          )}
+          <button
+            type="button"
+            disabled={page >= pageCount}
+            onClick={() => setPage(page + 1)}
+            aria-label="Next page"
+          >
+            ›
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DataTable({
+  columns,
+  rows,
+  rowKey,
+  actions,
+  searchPlaceholder,
+  countLabel = "records",
+  emptyIcon = "⌕",
+  emptyTitle = "No records found",
+  emptyText = "Try another search or add your first record.",
+}) {
+  const [term, setTerm] = useState("");
+  const needle = term.trim().toLowerCase();
+  const filtered = useMemo(
+    () =>
+      needle
+        ? rows.filter((row) =>
+            JSON.stringify(row).toLowerCase().includes(needle),
+          )
+        : rows,
+    [rows, needle],
+  );
+  const pagination = usePagination(filtered);
+  return (
+    <>
+      <div className="toolbar">
+        <SearchBox
+          value={term}
+          onChange={(value) => {
+            setTerm(value);
+            pagination.setPage(1);
+          }}
+          placeholder={searchPlaceholder}
+        />
+        <span className="result-count">
+          {filtered.length} {countLabel}
+        </span>
+      </div>
+      <div className="surface table-surface">
+        <table className="data-table">
+          <thead>
+            <tr>
+              {columns.map((column) => (
+                <th key={column.key}>{column.label}</th>
+              ))}
+              {actions && <th>Actions</th>}
+            </tr>
+          </thead>
+          <tbody>
+            {pagination.pageRows.map((item) => (
+              <tr key={rowKey(item)}>
+                {columns.map((column) => (
+                  <td key={column.key}>
+                    {column.render
+                      ? column.render(item)
+                      : (item[column.key] ?? "—")}
+                  </td>
+                ))}
+                {actions && <td className="row-actions">{actions(item)}</td>}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {!filtered.length && (
+          <EmptyState icon={emptyIcon} title={emptyTitle} text={emptyText} />
+        )}
+        {filtered.length > 0 && <Pagination pagination={pagination} />}
+      </div>
+    </>
+  );
 }
 
 function SidebarIcon({ name }) {
@@ -359,7 +535,7 @@ function Activation({ done }) {
         <div className="brand-lockup">
           <div className="brand-mark">H</div>
           <div>
-            <b>Hamza POS</b>
+            <b>Mekra POS</b>
             <span>Offline retail workspace</span>
           </div>
         </div>
@@ -432,14 +608,20 @@ function Sale({ navigate }) {
   const [customers, setCustomers] = useState([]);
   const [customerId, setCustomerId] = useState("");
   const [cash, setCash] = useState("");
+  const [discount, setDiscount] = useState("");
   const [held, setHeld] = useState([]);
   const [receipt, setReceipt] = useState(null);
   const [showRefund, setShowRefund] = useState(false);
-  const [scannerReady, setScannerReady] = useState(false);
+  const [scannerReady, setScannerReady] = useState(scannerSeen);
   const buffer = useRef("");
+  const lastKeyTime = useRef(0);
+  const maxGap = useRef(0);
+  const searchInput = useRef(null);
+  const searchValue = useRef("");
+  searchValue.current = search;
   const checkoutRef = useRef(String(Date.now()).slice(-5));
   const notify = useToast();
-  const total = useMemo(
+  const subtotal = useMemo(
     () =>
       cart.reduce(
         (sum, item) => sum + Number(item.selling_price) * item.qty,
@@ -447,30 +629,62 @@ function Sale({ navigate }) {
       ),
     [cart],
   );
+  const discountValue = Math.min(subtotal, Math.max(0, Number(discount || 0)));
+  const total = subtotal - discountValue;
   const change = Math.max(0, Number(cash || 0) - total);
 
   useEffect(() => {
     query("SELECT * FROM customers ORDER BY name")
       .then(setCustomers)
       .catch((error) => notify(error.message, "error"));
+    searchInput.current?.focus();
+    const SCAN_GAP_MS = 80; // scanners type much faster than a person
     const listener = (event) => {
-      if (
-        ["INPUT", "TEXTAREA", "SELECT"].includes(
-          document.activeElement?.tagName,
-        )
-      )
-        return;
+      // Ignore everything while a popup (refund, receipt, held carts) is open.
+      if (document.querySelector(".modal-backdrop")) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      const active = document.activeElement;
+      const tag = active?.tagName;
+      const inSearch = active === searchInput.current;
+      const inOtherField =
+        ["INPUT", "TEXTAREA", "SELECT"].includes(tag) && !inSearch;
       if (event.key === "Enter") {
         const value = buffer.current;
+        const fast = value.length >= 3 && maxGap.current <= SCAN_GAP_MS;
         buffer.current = "";
-        if (value) {
+        maxGap.current = 0;
+        lastKeyTime.current = 0;
+        if (inOtherField) return; // cash / discount / qty fields keep working normally
+        if (fast) {
+          // Stop Enter from "clicking" a focused button such as Complete sale.
+          event.preventDefault();
+          event.stopPropagation();
+          scannerSeen = true;
           setScannerReady(true);
+          setSearch("");
+          setResults([]);
           addProduct(value);
+          searchInput.current?.focus();
+        } else if (inSearch && searchValue.current.trim()) {
+          // Normal typing in the search box followed by Enter.
+          event.preventDefault();
+          addProduct(searchValue.current);
         }
-      } else if (event.key.length === 1) buffer.current += event.key;
+      } else if (event.key.length === 1) {
+        const now = performance.now();
+        const gap = lastKeyTime.current ? now - lastKeyTime.current : 0;
+        if (!lastKeyTime.current || gap > 300) {
+          buffer.current = "";
+          maxGap.current = 0;
+        } else if (buffer.current.length > 0) {
+          maxGap.current = Math.max(maxGap.current, gap);
+        }
+        lastKeyTime.current = now;
+        buffer.current += event.key;
+      }
     };
-    window.addEventListener("keydown", listener);
-    return () => window.removeEventListener("keydown", listener);
+    window.addEventListener("keydown", listener, true);
+    return () => window.removeEventListener("keydown", listener, true);
   }, []);
 
   async function addProduct(value) {
@@ -529,6 +743,10 @@ function Sale({ navigate }) {
       return notify("Add at least one product before checkout.", "warning");
     if (cart.some((item) => Number(item.qty) < 1))
       return notify("Each cart quantity must be at least 1.", "warning");
+    if (Number(discount || 0) < 0)
+      return notify("Discount cannot be negative.", "warning");
+    if (Number(discount || 0) > subtotal)
+      return notify("Discount cannot be more than the subtotal.", "warning");
     if (Number(cash || 0) < total && !customerId)
       return notify(
         "Select a Khata customer for an underpaid sale.",
@@ -539,10 +757,12 @@ function Sale({ navigate }) {
         cart,
         customerId,
         cashTendered: Number(cash || 0),
+        discount: discountValue,
       });
       setReceipt(result);
       setCart([]);
       setCash("");
+      setDiscount("");
       setCustomerId("");
       notify(
         `Receipt ${result.receiptCode || `#${result.receiptId}`} created.`,
@@ -602,6 +822,7 @@ function Sale({ navigate }) {
           <SearchBox
             value={search}
             onChange={searchItems}
+            inputRef={searchInput}
             placeholder="Scan barcode or search product..."
           />
           <button className="button primary" onClick={() => addProduct(search)}>
@@ -683,6 +904,16 @@ function Sale({ navigate }) {
               ))}
             </select>
           </Field>
+          <Field label="Discount">
+            <input
+              className="input large cash-input"
+              type="number"
+              min="0"
+              value={discount}
+              onChange={(event) => setDiscount(event.target.value)}
+              placeholder="0.00"
+            />
+          </Field>
           <Field label="Cash tendered">
             <input
               className="input large cash-input"
@@ -697,7 +928,11 @@ function Sale({ navigate }) {
         <div className="checkout-summary">
           <div>
             <span>Subtotal</span>
-            <b>{money(total)}</b>
+            <b>{money(subtotal)}</b>
+          </div>
+          <div className="discount-row">
+            <span>Discount</span>
+            <b>{discountValue > 0 ? `− ${money(discountValue)}` : "0.00"}</b>
           </div>
           <div>
             <span>Khata due</span>
@@ -772,6 +1007,12 @@ function Sale({ navigate }) {
             <h2>Receipt {receipt.receiptCode || `#${receipt.receiptId}`}</h2>
             <p>Your sale was saved locally.</p>
             <div className="receipt-result">
+              {receipt.discount > 0 && (
+                <div>
+                  <span>Discount</span>
+                  <b>{money(receipt.discount)}</b>
+                </div>
+              )}
               <div>
                 <span>Total</span>
                 <b>{money(receipt.total)}</b>
@@ -942,6 +1183,7 @@ function CrudPage({
   eyebrow,
   description,
   table,
+  listSql,
   columns,
   fields,
   createLabel = "Add record",
@@ -950,20 +1192,16 @@ function CrudPage({
   saveHandler,
 }) {
   const [items, setItems] = useState([]);
-  const [search, setSearch] = useState("");
   const [form, setForm] = useState(null);
   const [error, setError] = useState("");
   const notify = useToast();
   const load = () =>
-    query(`SELECT * FROM ${table} ORDER BY 1 DESC`)
+    query(listSql || `SELECT * FROM ${table} ORDER BY 1 DESC`)
       .then(setItems)
       .catch((error) => setError(error.message));
   useEffect(() => {
     load();
-  }, [table]);
-  const filtered = items.filter((item) =>
-    JSON.stringify(item).toLowerCase().includes(search.trim().toLowerCase()),
-  );
+  }, [table, listSql]);
   async function save(event) {
     event.preventDefault();
     try {
@@ -1015,57 +1253,28 @@ function CrudPage({
         }
       />
       {error && <div className="inline-error">{error}</div>}
-      <div className="toolbar">
-        <SearchBox value={search} onChange={setSearch} />
-        <span className="result-count">{filtered.length} records</span>
-      </div>
-      <div className="surface table-surface">
-        <table className="data-table">
-          <thead>
-            <tr>
-              {columns.map((column) => (
-                <th key={column.key}>{column.label}</th>
-              ))}
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.map((item) => (
-              <tr key={item[columns[0].key]}>
-                {columns.map((column) => (
-                  <td key={column.key}>
-                    {column.render
-                      ? column.render(item)
-                      : (item[column.key] ?? "—")}
-                  </td>
-                ))}
-                <td className="row-actions">
-                  {rowActions?.(item)}
-                  <button
-                    className="button tiny"
-                    onClick={() => setForm({ ...item, _editing: true })}
-                  >
-                    Edit
-                  </button>
-                  <button
-                    className="button tiny danger-text"
-                    onClick={() => remove(item)}
-                  >
-                    Delete
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {!filtered.length && (
-          <EmptyState
-            icon="⌕"
-            title="No records found"
-            text="Try another search or add your first record."
-          />
+      <DataTable
+        columns={columns}
+        rows={items}
+        rowKey={(item) => item[columns[0].key]}
+        actions={(item) => (
+          <>
+            {rowActions?.(item)}
+            <button
+              className="button tiny"
+              onClick={() => setForm({ ...item, _editing: true })}
+            >
+              Edit
+            </button>
+            <button
+              className="button tiny danger-text"
+              onClick={() => remove(item)}
+            >
+              Delete
+            </button>
+          </>
         )}
-      </div>
+      />
       {form && (
         <Modal
           title={
@@ -1300,7 +1509,7 @@ function Dashboard({ storeName }) {
           "SELECT COALESCE(SUM(total_amount),0) sales FROM receipts WHERE DATE(date_time)=CURRENT_DATE",
         ),
         one(
-          "SELECT COALESCE(SUM((ri.price_sold-p.purchase_price)*ri.qty_sold),0) profit FROM receipt_items ri JOIN products p ON p.sku=ri.sku JOIN receipts r ON r.receipt_id=ri.receipt_id WHERE DATE(r.date_time)=CURRENT_DATE",
+          "SELECT COALESCE(SUM((ri.price_sold-p.purchase_price)*ri.qty_sold),0) - (SELECT COALESCE(SUM(discount),0) FROM receipts WHERE DATE(date_time)=CURRENT_DATE) profit FROM receipt_items ri JOIN products p ON p.sku=ri.sku JOIN receipts r ON r.receipt_id=ri.receipt_id WHERE DATE(r.date_time)=CURRENT_DATE",
         ),
         one("SELECT COALESCE(SUM(current_balance),0) payables FROM suppliers"),
         one(
@@ -1397,8 +1606,10 @@ function Dashboard({ storeName }) {
             <strong>Barcode scanner</strong>
             <small>Keyboard input device</small>
           </div>
-          <StatusBadge tone={hardware.scanner ? "green" : "gray"}>
-            {hardware.scanner ? "Scanner ready" : "Not detected"}
+          <StatusBadge
+            tone={hardware.scanner || scannerSeen ? "green" : "gray"}
+          >
+            {hardware.scanner || scannerSeen ? "Scanner ready" : "Not detected"}
           </StatusBadge>
         </div>
         <div>
@@ -1709,7 +1920,6 @@ function StockIn() {
 
 function Transactions() {
   const [items, setItems] = useState([]);
-  const [search, setSearch] = useState("");
   const [error, setError] = useState("");
   const notify = useToast();
   const load = () =>
@@ -1719,28 +1929,28 @@ function Transactions() {
   useEffect(() => {
     load();
   }, []);
-  const filtered = items.filter(
-    (item) =>
-      String(item.receipt_code || item.receipt_id)
-        .toLowerCase()
-        .includes(search.trim().toLowerCase()) ||
-      String(item.receipt_id).includes(search.trim()) ||
-      String(item.date_time)
-        .toLowerCase()
-        .includes(search.trim().toLowerCase()),
-  );
   async function print(receiptId) {
     const result = await call("print-receipt", { receiptId });
     result.ok
       ? notify("Receipt sent to printer.")
       : notify(result.error, "error");
   }
+  async function remove(receiptId) {
+    if (!window.confirm("Delete this receipt and restore stock?")) return;
+    try {
+      await call("void-receipt", receiptId);
+      notify("Receipt deleted and stock restored.");
+      load();
+    } catch (error) {
+      notify(error.message, "error");
+    }
+  }
   return (
     <div className="module-page">
       <PageHeader
         eyebrow="Customers"
         title="Transactions"
-        description="Search, reprint and void completed receipts."
+        description="Search, reprint and delete completed receipts."
         actions={
           <button className="button ghost" onClick={load}>
             ↻ Refresh
@@ -1748,73 +1958,73 @@ function Transactions() {
         }
       />
       {error && <div className="inline-error">{error}</div>}
-      <div className="toolbar">
-        <SearchBox
-          value={search}
-          onChange={setSearch}
-          placeholder="Search receipt number or date..."
-        />
-        <span className="result-count">{filtered.length} receipts</span>
-      </div>
-      <div className="surface table-surface">
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>Receipt</th>
-              <th>Date & time</th>
-              <th>Customer</th>
-              <th>Total</th>
-              <th>Cash</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.map((item) => (
-              <tr key={item.receipt_id}>
-                <td>
-                  <strong>{item.receipt_code || `#${item.receipt_id}`}</strong>
-                </td>
-                <td>{item.date_time}</td>
-                <td>
-                  {item.customer_id ? `Khata #${item.customer_id}` : "Walk-in"}
-                </td>
-                <td>
-                  <strong>{money(item.total_amount)}</strong>
-                </td>
-                <td>{money(item.cash_tendered)}</td>
-                <td className="row-actions">
-                  <button
-                    className="button tiny"
-                    onClick={() => print(item.receipt_id)}
-                  >
-                    Print
-                  </button>
-                  <button
-                    className="button tiny danger-text"
-                    onClick={async () => {
-                      if (
-                        window.confirm("Void this receipt and restore stock?")
-                      ) {
-                        await call("void-receipt", item.receipt_id);
-                        notify("Receipt voided and stock restored.");
-                        load();
-                      }
-                    }}
-                  >
-                    Void
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {!filtered.length && (
-          <EmptyState
-            title="No receipts yet"
-            text="Completed sales will appear here."
-          />
+      <DataTable
+        columns={[
+          {
+            key: "receipt_code",
+            label: "Receipt",
+            render: (item) => (
+              <strong>{item.receipt_code || `#${item.receipt_id}`}</strong>
+            ),
+          },
+          { key: "date_time", label: "Date & time" },
+          {
+            key: "customer_id",
+            label: "Customer",
+            render: (item) =>
+              item.customer_id ? `Khata #${item.customer_id}` : "Walk-in",
+          },
+          {
+            key: "discount",
+            label: "Discount",
+            render: (item) =>
+              Number(item.discount) > 0 ? money(item.discount) : "—",
+          },
+          {
+            key: "total_amount",
+            label: "Total",
+            render: (item) => <strong>{money(item.total_amount)}</strong>,
+          },
+          {
+            key: "cash_tendered",
+            label: "Cash",
+            render: (item) => money(item.cash_tendered),
+          },
+        ]}
+        rows={items}
+        rowKey={(item) => item.receipt_id}
+        searchPlaceholder="Search receipt number or date..."
+        countLabel="receipts"
+        emptyIcon="◌"
+        emptyTitle="No receipts yet"
+        emptyText="Completed sales will appear here."
+        actions={(item) => (
+          <>
+            <button
+              className="button tiny"
+              onClick={() =>
+                call("receipt-preview", {
+                  receiptId: item.receipt_id,
+                }).catch((error) => notify(error.message, "error"))
+              }
+            >
+              Preview
+            </button>
+            <button
+              className="button tiny"
+              onClick={() => print(item.receipt_id)}
+            >
+              Print
+            </button>
+            <button
+              className="button tiny danger-text"
+              onClick={() => remove(item.receipt_id)}
+            >
+              Delete
+            </button>
+          </>
         )}
-      </div>
+      />
     </div>
   );
 }
@@ -1853,42 +2063,43 @@ function Reports() {
           Customer receipts
         </button>
       </div>
-      <div className="surface table-surface">
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>Payment</th>
-              <th>Date</th>
-              <th>{tab === "supplier" ? "Supplier" : "Customer"}</th>
-              <th>Amount</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((item) => (
-              <tr key={item.payment_id}>
-                <td>#{item.payment_id}</td>
-                <td>{item.date}</td>
-                <td>{item.name || "Unknown"}</td>
-                <td>
-                  <strong>{money(item.amount_paid)}</strong>
-                </td>
-                <td>
-                  <StatusBadge>
-                    {tab === "supplier" ? "Payable reduced" : "Khata reduced"}
-                  </StatusBadge>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {!rows.length && (
-          <EmptyState
-            title="No payment records"
-            text="Payments will appear here after you record them."
-          />
-        )}
-      </div>
+      <DataTable
+        key={tab}
+        columns={[
+          {
+            key: "payment_id",
+            label: "Payment",
+            render: (item) => `#${item.payment_id}`,
+          },
+          { key: "date", label: "Date" },
+          {
+            key: "name",
+            label: tab === "supplier" ? "Supplier" : "Customer",
+            render: (item) => item.name || "Unknown",
+          },
+          {
+            key: "amount_paid",
+            label: "Amount",
+            render: (item) => <strong>{money(item.amount_paid)}</strong>,
+          },
+          {
+            key: "status",
+            label: "Status",
+            render: () => (
+              <StatusBadge>
+                {tab === "supplier" ? "Payable reduced" : "Khata reduced"}
+              </StatusBadge>
+            ),
+          },
+        ]}
+        rows={rows}
+        rowKey={(item) => item.payment_id}
+        searchPlaceholder="Search payments by name, date or amount..."
+        countLabel="payments"
+        emptyIcon="◌"
+        emptyTitle="No payment records"
+        emptyText="Payments will appear here after you record them."
+      />
     </div>
   );
 }
@@ -2051,7 +2262,7 @@ function Settings({ theme, setTheme, onProfileSaved }) {
                   className="preview-sidebar"
                   style={{ background: theme.primary }}
                 >
-                  <strong>Hamza POS</strong>
+                  <strong>Mekra POS</strong>
                   <span
                     className="preview-nav-active"
                     style={{ background: theme.secondary }}
@@ -2221,6 +2432,25 @@ function Settings({ theme, setTheme, onProfileSaved }) {
                     Test print
                   </button>
                 </div>
+              </div>
+              <div className="hardware-setting">
+                <div>
+                  <strong>Receipt preview</strong>
+                  <span>
+                    See how the latest receipt will print, no printer needed.
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="button tiny"
+                  onClick={() =>
+                    call("receipt-preview", {}).catch((error) =>
+                      notify(error.message, "error"),
+                    )
+                  }
+                >
+                  Preview receipt
+                </button>
               </div>
               <div className="hardware-setting">
                 <div>
@@ -2438,6 +2668,7 @@ function ProductPage() {
       title="Products"
       description="Manage prices, stock, categories and barcode identity."
       table="products"
+      listSql="SELECT p.*, c.name AS category_name FROM products p LEFT JOIN categories c ON c.category_id=p.category_id ORDER BY p.sku DESC"
       columns={[
         { key: "sku", label: "SKU" },
         { key: "item_name", label: "Product" },
@@ -2462,7 +2693,11 @@ function ProductPage() {
             </strong>
           ),
         },
-        { key: "category_id", label: "Category" },
+        {
+          key: "category_name",
+          label: "Category",
+          render: (item) => item.category_name || "—",
+        },
       ]}
       fields={fields}
       createLabel="Add product"
@@ -2509,7 +2744,7 @@ function App() {
     return (
       <main className="activation">
         <div className="surface error-state">
-          <h2>Hamza POS could not start</h2>
+          <h2>Mekra POS could not start</h2>
           <p>{error}</p>
         </div>
       </main>
@@ -2622,7 +2857,7 @@ function App() {
         <div className="brand-lockup">
           <div className="brand-mark">H</div>
           <div>
-            <b>Hamza POS</b>
+            <b>Mekra POS</b>
             <span>Offline retail workspace</span>
           </div>
         </div>

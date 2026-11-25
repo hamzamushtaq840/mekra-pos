@@ -32,7 +32,7 @@ On the first launch, enter the fixed one-time setup PIN `827123`. The PIN field 
 The database is `pos_data.db` in the Electron `userData` directory. The theme is `theme.json` in the same directory and defaults to:
 
 ```json
-{"primary":"#2E7D32","secondary":"#FFFFFF","background":"#F5F5F5"}
+{ "primary": "#2E7D32", "secondary": "#FFFFFF", "background": "#F5F5F5" }
 ```
 
 The Settings screen updates the store profile row and theme colors without rebuilding the app. The store profile is constrained to one row and includes company name, trade, address, phone, email, logo path, and receipt footer text.
@@ -47,6 +47,8 @@ HID barcode scanners emulate keyboard input, so the dashboard reports physical s
 Developed by Hamza
 ```
 
+rm -rf release
+npm run dist:win
 before dispatching to an ESC/POS device.
 
 ## Operational modules

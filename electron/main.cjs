@@ -1,4 +1,11 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
+const {
+  app,
+  BrowserWindow,
+  ipcMain,
+  dialog,
+  shell,
+  nativeImage,
+} = require("electron");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -153,14 +160,329 @@ async function sendRaw(buffer) {
   }
 }
 
-const toAscii = (text) => String(text).replace(/[^\x20-\x7E\n]/g, "?");
-const receiptBytes = (text) =>
-  Buffer.concat([
-    Buffer.from([0x1b, 0x40]), // initialize
-    Buffer.from([0x1b, 0x61, 0x01]), // center
-    Buffer.from(toAscii(text) + "\n\n\n\n", "ascii"),
-    Buffer.from([0x1d, 0x56, 0x42, 0x00]), // feed and cut
-  ]);
+// ---------- Receipt builder (ESC/POS bytes + HTML preview) ----------
+const ESC = 0x1b;
+const GS = 0x1d;
+const RECEIPT_WIDTH = 48; // characters per line; use 42 if text wraps on your printer
+const LOGO_MAX_WIDTH = 288; // dots (a full 80mm line is about 576 dots)
+const LOGO_MAX_HEIGHT = 120;
+const ALIGN = { left: 0, center: 1, right: 2 };
+
+const toAscii = (text) => String(text ?? "").replace(/[^\x20-\x7E]/g, "?");
+const fmt = (n) =>
+  Number(n || 0).toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+
+function wrapText(text, width) {
+  const words = toAscii(text).split(/\s+/).filter(Boolean);
+  const lines = [];
+  let current = "";
+  for (let word of words) {
+    while (word.length > width) {
+      if (current) {
+        lines.push(current);
+        current = "";
+      }
+      lines.push(word.slice(0, width));
+      word = word.slice(width);
+    }
+    if (!word) continue;
+    if (!current) current = word;
+    else if (current.length + 1 + word.length <= width) current += " " + word;
+    else {
+      lines.push(current);
+      current = word;
+    }
+  }
+  if (current) lines.push(current);
+  return lines.length ? lines : [""];
+}
+
+function createReceipt(width = RECEIPT_WIDTH) {
+  const ops = [];
+  const state = { align: "left", bold: false, w: 1, h: 1 };
+  const cols = () => Math.floor(width / state.w);
+  const api = {
+    width,
+    set(partial) {
+      Object.assign(state, partial);
+      return api;
+    },
+    text(s = "") {
+      for (const line of String(s).split("\n"))
+        ops.push({ t: "text", text: toAscii(line), ...state });
+      return api;
+    },
+    wrap(s) {
+      wrapText(s, cols()).forEach((line) => api.text(line));
+      return api;
+    },
+    rule(ch = "-") {
+      return api.text(ch.repeat(cols()));
+    },
+    row(left, right) {
+      const total = cols();
+      right = toAscii(right);
+      left = toAscii(left).slice(0, Math.max(0, total - right.length - 1));
+      return api.text(
+        left + " ".repeat(total - left.length - right.length) + right,
+      );
+    },
+    feed(dots) {
+      ops.push({ t: "feed", dots });
+      return api;
+    },
+    image(img) {
+      ops.push({ t: "image", img, align: state.align });
+      return api;
+    },
+    toBytes() {
+      const out = [Buffer.from([ESC, 0x40])]; // initialize
+      for (const op of ops) {
+        if (op.t === "text") {
+          out.push(
+            Buffer.from([
+              ESC,
+              0x61,
+              ALIGN[op.align],
+              ESC,
+              0x45,
+              op.bold ? 1 : 0,
+              GS,
+              0x21,
+              ((op.w - 1) << 4) | (op.h - 1),
+            ]),
+          );
+          out.push(Buffer.from(op.text + "\n", "ascii"));
+        } else if (op.t === "feed") {
+          out.push(Buffer.from([ESC, 0x4a, op.dots]));
+        } else if (op.t === "image") {
+          out.push(Buffer.from([ESC, 0x61, ALIGN[op.align]]), op.img.escpos);
+        }
+      }
+      out.push(Buffer.from([ESC, 0x61, 0, ESC, 0x45, 0, GS, 0x21, 0]));
+      out.push(Buffer.from("\n\n\n\n", "ascii"));
+      out.push(Buffer.from([GS, 0x56, 0x42, 0x00])); // feed and cut
+      return Buffer.concat(out);
+    },
+    toHtml() {
+      const esc = (s) =>
+        String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
+      const body = ops
+        .map((op) => {
+          if (op.t === "feed")
+            return `<div style="height:${(op.dots / 24) * 1.25}em"></div>`;
+          if (op.t === "image")
+            return `<div style="text-align:${op.align}"><img src="${op.img.dataUrl}" style="width:${(op.img.width / (width * 12)) * 100}%;image-rendering:pixelated"></div>`;
+          const extraY = op.h / op.w;
+          return `<div class="ln" style="text-align:${op.align};font-weight:${op.bold ? 700 : 400};font-size:${op.w}em;height:${extraY * 1.25}em"><span style="display:inline-block;transform-origin:50% 0;transform:scaleY(${extraY})">${esc(op.text) || "&nbsp;"}</span></div>`;
+        })
+        .join("");
+      return `<!doctype html><html><head><meta charset="utf-8"><title>Receipt preview</title><style>
+        body{background:#d9d9d9;margin:0;padding:24px 0}
+        .paper{width:${width}ch;margin:0 auto;padding:20px 16px;background:#fff;box-shadow:0 2px 12px rgba(0,0,0,.25);
+          font-family:"SF Mono",Menlo,Consolas,monospace;font-size:14px;line-height:1.25;color:#000}
+        .ln{white-space:pre;overflow:visible}
+      </style></head><body><div class="paper">${body}</div></body></html>`;
+    },
+  };
+  return api;
+}
+
+// Converts the store logo into a 1-bit ESC/POS raster image (GS v 0).
+function loadLogo(logoPath) {
+  try {
+    const file = resolveImagePath(logoPath);
+    if (!file || !fs.existsSync(file)) return null;
+    let img = nativeImage.createFromPath(file);
+    if (img.isEmpty()) return null;
+    const size = img.getSize();
+    const scale = Math.min(
+      LOGO_MAX_WIDTH / size.width,
+      LOGO_MAX_HEIGHT / size.height,
+      1,
+    );
+    img = img.resize({
+      width: Math.max(8, Math.round(size.width * scale)),
+      height: Math.max(1, Math.round(size.height * scale)),
+      quality: "best",
+    });
+    const { width, height } = img.getSize();
+    const bgra = img.toBitmap();
+    const rowBytes = Math.ceil(width / 8);
+    const data = Buffer.alloc(rowBytes * height);
+    const preview = Buffer.alloc(width * height * 4, 255);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = (y * width + x) * 4;
+        // transparent pixels count as white paper
+        const lum =
+          0.114 * bgra[i] +
+          0.587 * bgra[i + 1] +
+          0.299 * bgra[i + 2] +
+          (255 - bgra[i + 3]);
+        if (lum < 128) {
+          data[y * rowBytes + (x >> 3)] |= 0x80 >> (x & 7);
+          preview[i] = preview[i + 1] = preview[i + 2] = 0;
+        }
+      }
+    }
+    const header = Buffer.from([
+      GS,
+      0x76,
+      0x30,
+      0x00,
+      rowBytes & 255,
+      rowBytes >> 8,
+      height & 255,
+      height >> 8,
+    ]);
+    const dataUrl = nativeImage
+      .createFromBitmap(preview, { width, height })
+      .toDataURL();
+    return { width, height, escpos: Buffer.concat([header, data]), dataUrl };
+  } catch (error) {
+    logError("logo failed", error);
+    return null;
+  }
+}
+
+// SQLite stores CURRENT_TIMESTAMP in UTC, so convert it to the PC's local time.
+function receiptTime(dbValue) {
+  const d = new Date(String(dbValue || "").replace(" ", "T") + "Z");
+  if (isNaN(d)) return { date: String(dbValue || ""), time: "" };
+  return {
+    date: d.toLocaleDateString("en-GB", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    }),
+    time: d.toLocaleTimeString("en-US", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: true,
+    }),
+  };
+}
+
+const SAMPLE_ITEMS = [
+  { item_name: "Premium Basmati Rice 5kg", qty_sold: 1, price_sold: 1050 },
+  { item_name: "Cooking Oil 1L", qty_sold: 2, price_sold: 510 },
+  { item_name: "Cola Can 330ml", qty_sold: 3, price_sold: 110 },
+];
+
+// With a receiptId it builds that receipt. Without one it uses the latest
+// receipt, or a sample if there are none (used by the preview).
+function buildReceipt(receiptId) {
+  let receipt = receiptId
+    ? one("SELECT * FROM receipts WHERE receipt_id=?", [receiptId])
+    : one("SELECT * FROM receipts ORDER BY receipt_id DESC LIMIT 1");
+  if (receiptId && !receipt) throw new Error("Receipt not found.");
+  let items;
+  if (receipt) {
+    items = rows("SELECT * FROM receipt_items WHERE receipt_id=?", [
+      receipt.receipt_id,
+    ]);
+  } else {
+    items = SAMPLE_ITEMS;
+    receipt = {
+      receipt_code: "R-SAMPLE",
+      date_time: new Date().toISOString().slice(0, 19).replace("T", " "),
+      total_amount: 2400,
+      discount: 0,
+      cash_tendered: 2500,
+      customer_id: null,
+    };
+  }
+  const profile = one("SELECT * FROM store_profile WHERE id=1") || {};
+  const customer = receipt.customer_id
+    ? one("SELECT name FROM customers WHERE customer_id=?", [
+        receipt.customer_id,
+      ])
+    : null;
+  const { date, time } = receiptTime(receipt.date_time);
+  // total_amount is the final amount after discount.
+  const total = Number(receipt.total_amount || 0);
+  const discount = Number(receipt.discount || 0);
+  const cash = Number(receipt.cash_tendered || 0);
+
+  const r = createReceipt();
+
+  // ----- header -----
+  r.set({ align: "center" });
+  const logo = loadLogo(profile.logo_path);
+  if (logo) r.image(logo).feed(8);
+  const name = (profile.company_name || "My Store").toUpperCase();
+  const big = name.length <= r.width / 2;
+  r.set({ bold: true, w: big ? 2 : 1, h: 2 }).wrap(name);
+  r.set({ bold: false, w: 1, h: 1 });
+  if (profile.business_trade) r.wrap(profile.business_trade);
+  if (profile.address) r.wrap(profile.address);
+  if (profile.phone_no) r.text(profile.phone_no);
+
+  // ----- receipt info -----
+  r.set({ align: "left" }).feed(6).rule("-");
+  r.row("Receipt:", receipt.receipt_code || `#${receipt.receipt_id}`);
+  r.row("Date:", date);
+  if (time) r.row("Time:", time);
+  r.row("Customer:", customer?.name || "Walk-in");
+  r.rule("-");
+
+  // ----- items -----
+  r.set({ bold: true }).row("ITEM", "AMOUNT");
+  r.set({ bold: false }).rule("-");
+  for (const item of items) {
+    r.wrap(item.item_name);
+    r.row(
+      `  ${item.qty_sold} x ${fmt(item.price_sold)}`,
+      fmt(item.price_sold * item.qty_sold),
+    );
+    r.feed(8);
+  }
+  r.rule("-");
+
+  // ----- totals -----
+  const totalQty = items.reduce((sum, i) => sum + Number(i.qty_sold || 0), 0);
+  r.row(`Items: ${items.length}`, `Qty: ${totalQty}`).feed(6);
+  if (discount > 0) {
+    r.row("SUBTOTAL", fmt(total + discount));
+    r.row("DISCOUNT", `-${fmt(discount)}`);
+  }
+  r.set({ bold: true, h: 2 }).row("TOTAL", fmt(total));
+  r.set({ bold: false, h: 1 });
+  if (cash >= total) {
+    r.row("CASH", fmt(cash));
+    r.row("CHANGE", fmt(cash - total));
+  } else {
+    r.row("PAID", fmt(cash));
+    r.set({ bold: true }).row("KHATA DUE", fmt(total - cash));
+    r.set({ bold: false });
+  }
+  r.rule("-");
+
+  // ----- footer -----
+  r.feed(8).set({ align: "center" });
+  r.wrap(profile.message_at_end || "Thank you for shopping");
+  r.text("Developed by Hamza");
+  return r;
+}
+
+function testReceipt() {
+  const r = createReceipt();
+  r.set({ align: "center", bold: true, h: 2 }).text("TEST PRINT");
+  r.set({ bold: false, h: 1 }).rule("-");
+  r.text("Mekra POS printer works.");
+  r.set({ align: "left" }).feed(6);
+  r.text("123456789012345678901234567890123456789012345678"); // width ruler
+  r.row("Left", "Right");
+  r.rule("-");
+  return r;
+}
 const DRAWER_KICK = Buffer.from([0x1b, 0x70, 0x00, 0x19, 0xfa]);
 
 ipcMain.handle("open-log-folder", async () => {
@@ -186,7 +508,7 @@ function initDb(pin) {
     CREATE TABLE IF NOT EXISTS customer_payments (payment_id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT DEFAULT CURRENT_TIMESTAMP, customer_id INTEGER, amount_paid REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS products (sku TEXT PRIMARY KEY, category_id INTEGER, supplier_id INTEGER, item_name TEXT NOT NULL, description TEXT, purchase_price REAL DEFAULT 0, selling_price REAL DEFAULT 0, size TEXT, weight TEXT, age_restriction INTEGER DEFAULT 0, start_date TEXT, end_date TEXT, expiry_date TEXT, quantity INTEGER DEFAULT 0, low_stock_alert INTEGER DEFAULT 5);
     CREATE TABLE IF NOT EXISTS held_carts (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT DEFAULT CURRENT_TIMESTAMP, cart_data TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS receipts (receipt_id INTEGER PRIMARY KEY AUTOINCREMENT, receipt_code TEXT, date_time TEXT DEFAULT CURRENT_TIMESTAMP, total_amount REAL NOT NULL, customer_id INTEGER, cash_tendered REAL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS receipts (receipt_id INTEGER PRIMARY KEY AUTOINCREMENT, receipt_code TEXT, date_time TEXT DEFAULT CURRENT_TIMESTAMP, total_amount REAL NOT NULL, discount REAL DEFAULT 0, customer_id INTEGER, cash_tendered REAL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS receipt_items (id INTEGER PRIMARY KEY AUTOINCREMENT, receipt_id INTEGER, sku TEXT, item_name TEXT, qty_sold INTEGER, price_sold REAL);
     CREATE TABLE IF NOT EXISTS refunds (id INTEGER PRIMARY KEY AUTOINCREMENT, date_time TEXT DEFAULT CURRENT_TIMESTAMP, sku TEXT, qty INTEGER, amount REAL);
     INSERT OR IGNORE INTO store_profile (id, company_name, business_trade, message_at_end) VALUES (1, 'My Store', 'Retail Store', 'Thank you for shopping');
@@ -207,10 +529,24 @@ function initDb(pin) {
       receipt.receipt_id,
     ]);
   }
+  migrateDatabase();
   fs.writeFileSync(themePath, JSON.stringify(DEFAULT_THEME, null, 2));
   db.prepare(
     "INSERT OR REPLACE INTO app_meta(key,value) VALUES('admin_pin',?)",
   ).run(pin);
+}
+
+// Runs on every app start so databases created before a feature existed get
+// the new columns without losing data.
+function migrateDatabase() {
+  const hasReceipts = one(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='receipts'",
+  );
+  if (!hasReceipts) return;
+  const columns = rows("PRAGMA table_info(receipts)");
+  if (!columns.some((column) => column.name === "discount")) {
+    db.exec("ALTER TABLE receipts ADD COLUMN discount REAL DEFAULT 0");
+  }
 }
 
 function seedDemoData() {
@@ -721,38 +1057,63 @@ function setupIpc() {
     );
     return one("SELECT * FROM products WHERE sku=?", [sku]);
   });
-  ipcMain.handle("checkout", (_, { cart, customerId, cashTendered }) => {
-    const total = cart.reduce((s, i) => s + i.selling_price * i.qty, 0);
-    const receiptCode = uniqueReceiptCode();
-    const receipt = run(
-      "INSERT INTO receipts(receipt_code,total_amount,customer_id,cash_tendered) VALUES(?,?,?,?)",
-      [receiptCode, total, customerId || null, cashTendered],
-    );
-    const add = db.transaction(() =>
-      cart.forEach((i) => {
-        run(
-          "INSERT INTO receipt_items(receipt_id,sku,item_name,qty_sold,price_sold) VALUES(?,?,?,?,?)",
-          [receipt.lastInsertRowid, i.sku, i.item_name, i.qty, i.selling_price],
+  ipcMain.handle(
+    "checkout",
+    (_, { cart, customerId, cashTendered, discount }) => {
+      const subtotal = cart.reduce((s, i) => s + i.selling_price * i.qty, 0);
+      // Discount is clamped so the total can never go negative.
+      const discountAmount = Math.min(
+        subtotal,
+        Math.max(0, Number(discount) || 0),
+      );
+      const total = subtotal - discountAmount;
+      const receiptCode = uniqueReceiptCode();
+      const save = db.transaction(() => {
+        const receipt = run(
+          "INSERT INTO receipts(receipt_code,total_amount,discount,customer_id,cash_tendered) VALUES(?,?,?,?,?)",
+          [
+            receiptCode,
+            total,
+            discountAmount,
+            customerId || null,
+            cashTendered,
+          ],
         );
-        run("UPDATE products SET quantity=quantity-? WHERE sku=?", [
-          i.qty,
-          i.sku,
-        ]);
+        cart.forEach((i) => {
+          run(
+            "INSERT INTO receipt_items(receipt_id,sku,item_name,qty_sold,price_sold) VALUES(?,?,?,?,?)",
+            [
+              receipt.lastInsertRowid,
+              i.sku,
+              i.item_name,
+              i.qty,
+              i.selling_price,
+            ],
+          );
+          run("UPDATE products SET quantity=quantity-? WHERE sku=?", [
+            i.qty,
+            i.sku,
+          ]);
+        });
+        // Khata balance is added once per sale (not once per cart line).
         if (customerId && cashTendered < total)
           run(
             "UPDATE customers SET current_balance=current_balance+? WHERE customer_id=?",
             [total - cashTendered, customerId],
           );
-      }),
-    );
-    add();
-    return {
-      receiptId: receipt.lastInsertRowid,
-      receiptCode,
-      total,
-      change: cashTendered - total,
-    };
-  });
+        return receipt.lastInsertRowid;
+      });
+      const receiptId = save();
+      return {
+        receiptId,
+        receiptCode,
+        subtotal,
+        discount: discountAmount,
+        total,
+        change: cashTendered - total,
+      };
+    },
+  );
   ipcMain.handle("hold", (_, cart) =>
     run("INSERT INTO held_carts(cart_data) VALUES(?)", [JSON.stringify(cart)]),
   );
@@ -794,39 +1155,8 @@ function setupIpc() {
     return { total };
   });
   ipcMain.handle("print-receipt", async (_, { receiptId }) => {
-    const receipt = one("SELECT * FROM receipts WHERE receipt_id=?", [
-      receiptId,
-    ]);
-    if (!receipt) throw new Error("Receipt not found.");
-    const items = rows("SELECT * FROM receipt_items WHERE receipt_id=?", [
-      receiptId,
-    ]);
-    const profile = one("SELECT * FROM store_profile WHERE id=1") || {};
-    const lines = [
-      profile.company_name || "My Store",
-      profile.business_trade || "",
-      profile.address || "",
-      profile.phone_no || "",
-      "--------------------------------",
-      `Receipt ${receipt.receipt_code || `#${receipt.receipt_id}`}`,
-      receipt.date_time,
-      "--------------------------------",
-      ...items.map(
-        (item) =>
-          `${item.item_name} x${item.qty_sold}  ${Number(item.price_sold * item.qty_sold).toFixed(2)}`,
-      ),
-      "--------------------------------",
-      `TOTAL                 ${Number(receipt.total_amount).toFixed(2)}`,
-      `CASH                  ${Number(receipt.cash_tendered).toFixed(2)}`,
-      `CHANGE                ${Number(receipt.cash_tendered - receipt.total_amount).toFixed(2)}`,
-      profile.message_at_end || "Thank you for shopping",
-      "Developed by Hamza",
-      "",
-    ]
-      .filter(Boolean)
-      .join("\n");
     try {
-      await sendRaw(receiptBytes(lines));
+      await sendRaw(buildReceipt(receiptId).toBytes());
       return { ok: true, receiptId };
     } catch (error) {
       logError("print-receipt failed", error);
@@ -837,6 +1167,8 @@ function setupIpc() {
       };
     }
   });
+  // Channel name kept as "void-receipt" so existing code keeps working;
+  // the UI now calls this action "Delete".
   ipcMain.handle("void-receipt", (_, receiptId) => {
     const items = rows("SELECT * FROM receipt_items WHERE receipt_id=?", [
       receiptId,
@@ -892,16 +1224,27 @@ function setupIpc() {
 
   ipcMain.handle("printer-test", async () => {
     try {
-      await sendRaw(
-        receiptBytes(
-          "TEST PRINT\n--------------------------------\nHamza POS printer works.\n--------------------------------",
-        ),
-      );
+      await sendRaw(testReceipt().toBytes());
       return { ok: true };
     } catch (error) {
       logError("printer-test failed", error);
       return { ok: false, error: `Printer unavailable: ${error.message}` };
     }
+  });
+
+  // Shows the receipt in a window, so you can check the layout without a printer.
+  ipcMain.handle("receipt-preview", (_, payload) => {
+    const html = buildReceipt(payload?.receiptId).toHtml();
+    const file = path.join(os.tmpdir(), `hamza-pos-receipt-${Date.now()}.html`);
+    fs.writeFileSync(file, html);
+    const win = new BrowserWindow({
+      width: 480,
+      height: 900,
+      title: "Receipt preview",
+      autoHideMenuBar: true,
+    });
+    win.loadFile(file);
+    return { ok: true };
   });
 }
 function createWindow() {
@@ -944,6 +1287,8 @@ function createWindow() {
 app.whenReady().then(() => {
   ensureRuntime();
   ensureDatabaseBootstrap();
+  // Adds new columns (e.g. receipts.discount) to existing databases.
+  migrateDatabase();
   // Register every renderer bridge before creating the window.
   setupIpc();
   createWindow();
