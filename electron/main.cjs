@@ -20,7 +20,7 @@ const Database = require("better-sqlite3");
 const userDir = app.getPath("userData");
 const db = new Database(path.join(userDir, "pos_data.db"));
 const themePath = path.join(userDir, "theme.json");
-const SETUP_PIN = "827123";
+const SETUP_PIN = "";
 const DEFAULT_THEME = {
   primary: "#2E7D32",
   secondary: "#FFFFFF",
